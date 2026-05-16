@@ -5,9 +5,36 @@ build/
 dist/
 wheels/
 *.egg-info
+*.egg
 
 # Virtual environments
-.venv
-.env
-/whatsapp_session
+.venv/
+.env/
+
+# uv
+uv.lock
+
+# Playwright session data
+whatsapp_session/
+
+# Runtime logs and CSVs
 messages.log
+*.log
+sent.csv
+failed.csv
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Playwright browsers (installed per-OS)
+browser/

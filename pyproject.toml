@@ -1,9 +1,9 @@
 [project]
 name = "whatsapp-bulk-message"
 version = "0.1.0"
-description = "Add your description here"
+description = "Bulk WhatsApp messenger for wedding invitations via Playwright"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "playwright>=1.40.0",
     "click>=8.1.0"
