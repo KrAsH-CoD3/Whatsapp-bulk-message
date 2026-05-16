@@ -1,0 +1,12 @@
+Hi {{name}}!
+
+You're invited to our wedding! 🎉
+
+Date: Saturday, June 15, 2026
+Time: 4:00 PM
+Venue: The Grand Garden, 123 Main Street
+
+We'd love to celebrate with you. Please RSVP by May 30th.
+
+With love,
+[Your Names]
