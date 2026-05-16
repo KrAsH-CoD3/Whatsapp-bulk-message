@@ -7,13 +7,14 @@ import logging
 import os
 import random
 import re
-import signal
 import sys
 from datetime import datetime
+from itertools import count
 from pathlib import Path
 
 import click
 from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PwTimeoutError
 
 # --- Config ---
 SESSION_DIR = Path("./whatsapp_session")
@@ -140,23 +141,21 @@ async def type_message(page, message: str):
         else:
             await page.keyboard.type(char)
 
+async def click_send_btn(page, send_btn_xpath: str):
+    """Click the send button."""
+    send_btn = await page.wait_for_selector(send_btn_xpath, timeout=15_000)
+    await send_btn.click()
+
 
 # --- WhatsApp Web automation ---
 async def send_message(page, phone: str, message: str, image_path: Path | None = None) -> bool:
     """Search contact, open chat, send message + optional image, return to list."""
-    BACK_BUTTON = 'span[data-testid="back"]'
     SEARCH_BAR = '*[aria-label="Search or start a new chat"]'
     CLEAR_SEARCH_BUTTON = '*[aria-label="End icon button"]'
     SEARCH_RESULT = 'xpath=//*[@id="pane-side"]//div[@data-testid="list-item-1"]'
     SEND_BUTTON = 'span[data-testid="wds-ic-send-filled"]'
     IMG_MESSAGE_INPUT = '[aria-label*="Type a message"]'
     MESSAGE_INPUT = '[aria-label*="Type a message"]'
-
-    # Ensure we're on the chat list
-    back = await page.query_selector(BACK_BUTTON)
-    if back:
-        await back.click()
-        await asyncio.sleep(1)
 
     # Click search bar or clear button, type phone
     selector = await page.wait_for_selector(SEARCH_BAR + ", " + CLEAR_SEARCH_BUTTON, timeout=15_000)
@@ -179,12 +178,13 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
     await page.wait_for_selector('div[data-testid="conversation-panel-wrapper"]', timeout=15_000)
 
     if image_path and image_path.exists():
+        attach_btn = await page.wait_for_selector('span[data-testid="plus-rounded"]', timeout=10_000)
+        await attach_btn.click()
+
         # Attach image via file chooser
         async with page.expect_file_chooser() as fc_info:
-            attach_btn = await page.wait_for_selector('span[data-testid="plus-rounded"]', timeout=10_000)
-            await attach_btn.click()
-        photo_option = await page.wait_for_selector("text=Photos & videos", timeout=10_000)
-        await photo_option.click()
+            photo_option = await page.wait_for_selector("text=Photos & videos", timeout=10_000)
+            await photo_option.click()
         file_chooser = await fc_info.value
         await file_chooser.set_files(str(image_path))
 
@@ -198,19 +198,13 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
             await caption.click()
             await type_message(page, message)
             await asyncio.sleep(1)
-
-        # Send
-        send_btn = await page.wait_for_selector(SEND_BUTTON, timeout=15_000)
-        await send_btn.click()
     else:
         # Type message
         msg_input = await page.wait_for_selector(MESSAGE_INPUT, timeout=15_000)
         await msg_input.click()
         await type_message(page, message)
 
-        # Send
-        send_btn = await page.wait_for_selector(SEND_BUTTON, timeout=15_000)
-        await send_btn.click()
+    await click_send_btn(page, SEND_BUTTON)
 
     await asyncio.sleep(1)
 
@@ -290,7 +284,6 @@ async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, 
 
     # Launch Playwright
     SESSION_DIR.mkdir(exist_ok=True)
-    browser = None
     sent_count = 0
     failed_count = 0
 
@@ -305,19 +298,21 @@ async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, 
 
             # Check if already logged in
             await page.goto("https://web.whatsapp.com")
-            try:
-                await page.wait_for_selector(
-                    'div[data-testid="default-user"], div[data-testid="chat-list"]',
-                    timeout=15_000
-                )
-                logger.info("Session active — already logged in.")
-            except Exception:
-                logger.info("Scan QR code now... waiting for login.")
-                await page.wait_for_selector(
-                    'div[data-testid="default-user"], div[data-testid="chat-list"]',
-                    timeout=120_000
-                )
-                logger.info("Logged in!")
+
+            for i in count(start=1, step=1):
+                try:
+                    await page.wait_for_selector(
+                        'div[data-testid="default-user"], div[data-testid="chat-list"]',
+                        timeout=5_000
+                    )
+                    logger.info("Session active - logged in!")
+                    break
+                except PwTimeoutError:
+                    qr_visible = await page.locator('//*[contains(@aria-label, "QR code")]').is_visible()
+                    if qr_visible:
+                        if i == 1:
+                            logger.info("Scan QR code now... waiting for login.")
+                        await asyncio.sleep(2)
 
             for i, contact in enumerate(pending, 1):
                 name = contact["name"]
@@ -355,11 +350,8 @@ async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, 
             logger.info(f"=== Complete: {sent_count} sent, {failed_count} failed ===")
 
     except KeyboardInterrupt:
-        logger.info("\nInterrupted by user. Closing browser...")
+        logger.info("\nInterrupted by user.")
         logger.info(f"Progress so far: {sent_count} sent, {failed_count} failed")
-    finally:
-        if browser:
-            await browser.close()
 
 
 @click.command()
