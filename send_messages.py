@@ -4,8 +4,10 @@
 import asyncio
 import csv
 import logging
+import os
 import random
 import re
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +26,7 @@ DEFAULT_COUNTRY_CODE = "+234"
 MIN_DELAY = 8
 MAX_DELAY = 15
 MAX_RETRIES = 1
+MAX_IMAGE_SIZE_MB = 16
 
 # --- Logging ---
 log_file = Path("messages.log")
@@ -42,28 +45,48 @@ logger = logging.getLogger(__name__)
 def clean_phone(raw: str, default_code: str = DEFAULT_COUNTRY_CODE) -> str:
     """Strip non-digits, add country code if missing, return WhatsApp-safe number."""
     digits = re.sub(r"[^\d+]", "", raw.strip())
-    if digits.startswith("+"):
-        return digits
+    # Collapse multiple + to one
+    digits = "+" + digits.replace("+", "")
     if digits.startswith("00"):
-        return "+" + digits[2:]
+        digits = "+" + digits[2:]
     if digits.startswith("0"):
         digits = digits[1:]
     if not digits.startswith("+"):
-        digits = default_code.lstrip("+") + digits
-        digits = "+" + digits
+        digits = "+" + default_code.lstrip("+") + digits
+    # Strip leading zeros after country code: +2340801... → +234801...
+    match = re.match(r"^(\+\d{1,3})0+(\d+)$", digits)
+    if match:
+        digits = match.group(1) + match.group(2)
     return digits
 
 def is_valid_phone(phone: str) -> bool:
-    """Basic check: + followed by 7-15 digits."""
+    """Basic check: + followed by 7-15 digits, no double +."""
     return bool(re.match(r"^\+\d{7,15}$", phone))
 
 
 # --- CSV helpers ---
+def normalize_headers(headers: list[str]) -> dict[str, str]:
+    """Map case-insensitive header names to canonical keys."""
+    mapping = {}
+    for h in headers:
+        lower = h.strip().lower()
+        if lower in ("name", "phone"):
+            mapping[h] = lower
+    return mapping
+
 def load_contacts(path: Path = CONTACTS_CSV) -> list[dict]:
-    """Load contacts from CSV. Expects columns: name, phone."""
+    """Load contacts from CSV. Expects columns: name, phone (case-insensitive)."""
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        return list(reader)
+        if reader.fieldnames:
+            header_map = normalize_headers(reader.fieldnames)
+            if "name" not in header_map.values() or "phone" not in header_map.values():
+                raise ValueError(f"CSV must have 'name' and 'phone' columns. Found: {reader.fieldnames}")
+            contacts = []
+            for row in reader:
+                contacts.append({header_map.get(k, k): v for k, v in row.items()})
+            return contacts
+        return []
 
 def load_sent(path: Path = SENT_LOG) -> set[str]:
     """Load set of already-sent phone numbers."""
@@ -84,7 +107,7 @@ def load_failed(path: Path = FAILED_LOG) -> set[str]:
 def log_sent(contact: dict, path: Path = SENT_LOG):
     """Append a contact to the sent log."""
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "phone", "timestamp"])
+        writer = csv.DictWriter(f, fieldnames=["name", "phone", "timestamp"], extrasaction="ignore")
         if path.stat().st_size == 0:
             writer.writeheader()
         writer.writerow({**contact, "timestamp": datetime.now().isoformat()})
@@ -92,7 +115,7 @@ def log_sent(contact: dict, path: Path = SENT_LOG):
 def log_failed(contact: dict, reason: str, path: Path = FAILED_LOG):
     """Append a contact to the failed log."""
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "phone", "reason", "timestamp"])
+        writer = csv.DictWriter(f, fieldnames=["name", "phone", "reason", "timestamp"], extrasaction="ignore")
         if path.stat().st_size == 0:
             writer.writeheader()
         writer.writerow({**contact, "reason": reason, "timestamp": datetime.now().isoformat()})
@@ -128,7 +151,7 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
     SEND_BUTTON = 'span[data-testid="wds-ic-send-filled"]'
     IMG_MESSAGE_INPUT = '[aria-label*="Type a message"]'
     MESSAGE_INPUT = '[aria-label*="Type a message"]'
-    
+
     # Ensure we're on the chat list
     back = await page.query_selector(BACK_BUTTON)
     if back:
@@ -138,8 +161,6 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
     # Click search bar or clear button, type phone
     selector = await page.wait_for_selector(SEARCH_BAR + ", " + CLEAR_SEARCH_BUTTON, timeout=15_000)
     await selector.click()
-    # await page.keyboard.press("Meta+A")
-    # await page.keyboard.press("Delete")
     await selector.fill(phone)
 
     # Wait for search results to populate
@@ -159,13 +180,11 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
 
     if image_path and image_path.exists():
         # Attach image via file chooser
-        async with page.expect_file_chooser() as fc_info: 
+        async with page.expect_file_chooser() as fc_info:
             attach_btn = await page.wait_for_selector('span[data-testid="plus-rounded"]', timeout=10_000)
             await attach_btn.click()
-            await asyncio.sleep(2)
-            photo_option = await page.wait_for_selector("text=Photos & videos", timeout=10_000)
-            await photo_option.click()
-            await asyncio.sleep(2)
+        photo_option = await page.wait_for_selector("text=Photos & videos", timeout=10_000)
+        await photo_option.click()
         file_chooser = await fc_info.value
         await file_chooser.set_files(str(image_path))
 
@@ -173,7 +192,7 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
         await page.wait_for_selector('[aria-label="Add file"]', timeout=15_000)
         await asyncio.sleep(2)
 
-        # Type caption — use the caption input below the preview
+        # Type caption
         caption = await page.query_selector(IMG_MESSAGE_INPUT)
         if caption:
             await caption.click()
@@ -195,12 +214,8 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
 
     await asyncio.sleep(1)
 
-    # # Return to chat list
-    # back = await page.wait_for_selector(BACK_BUTTON, timeout=10000)
-    # await back.click()
-    # await asyncio.sleep(1)
-
     return True
+
 
 async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, country_code: str):
     """Main execution loop."""
@@ -210,18 +225,34 @@ async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, 
     logger.info(f"Image: {IMAGE_FILE}")
     logger.info(f"Session: {SESSION_DIR}")
 
+    # Validate required files
+    for f, desc in [(CONTACTS_CSV, "Contacts CSV"), (MESSAGE_FILE, "Message template")]:
+        if not f.exists():
+            logger.error(f"{desc} not found: {f}")
+            sys.exit(1)
+
+    # Validate image if configured
+    if IMAGE_FILE.exists():
+        size_mb = IMAGE_FILE.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_IMAGE_SIZE_MB:
+            logger.warning(f"Image is {size_mb:.1f} MB (max {MAX_IMAGE_SIZE_MB} MB). WhatsApp may reject it.")
+
     # Load data
     contacts = load_contacts()
     sent_phones = load_sent()
     failed_phones = load_failed()
     template = load_template()
 
+    if not template.strip():
+        logger.warning("Message template is empty!")
+
     logger.info(f"Total contacts: {len(contacts)}")
     logger.info(f"Already sent: {len(sent_phones)}")
     logger.info(f"Previously failed: {len(failed_phones)}")
 
-    # Filter: sent takes priority, failed gets retried
+    # Filter: sent takes priority, failed gets retried, deduplicate
     pending = []
+    seen_phones = set()
     for c in contacts:
         phone = clean_phone(c["phone"], country_code)
         if not is_valid_phone(phone):
@@ -229,11 +260,14 @@ async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, 
             log_failed({**c, "phone": phone}, "invalid phone format")
             continue
         if phone in sent_phones:
-            # Already sent — never retry, even if also in failed.csv
+            continue
+        if phone in seen_phones:
+            logger.info(f"Skipping duplicate: {c['name']} ({phone})")
             continue
         if phone in failed_phones:
             logger.info(f"Retrying previously failed: {c['name']} ({phone})")
         c["phone"] = phone
+        seen_phones.add(phone)
         pending.append(c)
 
     if limit:
@@ -256,70 +290,77 @@ async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, 
 
     # Launch Playwright
     SESSION_DIR.mkdir(exist_ok=True)
-    async with async_playwright() as p:
-        browser = await p.chromium.launch_persistent_context(
-            user_data_dir=str(SESSION_DIR),
-            headless=False,
-            viewport={"width": 1080, "height": 720},
-        )
-        page = browser.pages[0] if browser.pages else await browser.new_page()
+    browser = None
+    sent_count = 0
+    failed_count = 0
 
-        # Check if already logged in
-        await page.goto("https://web.whatsapp.com")
-        try:
-            # After login: default-user (no chats) or chat-list (has conversations)
-            await page.wait_for_selector(
-                'div[data-testid="default-user"], div[data-testid="chat-list"]',
-                timeout=15000
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch_persistent_context(
+                user_data_dir=str(SESSION_DIR),
+                headless=False,
+                viewport={"width": 1080, "height": 720},
             )
-            logger.info("Session active — already logged in.")
-        except Exception:
-            logger.info("Scan QR code now... waiting for login.")
-            await page.wait_for_selector(
-                'div[data-testid="default-user"], div[data-testid="chat-list"]',
-                timeout=120000
-            )
-            logger.info("Logged in!")
+            page = browser.pages[0] if browser.pages else await browser.new_page()
 
-        sent_count = 0
-        failed_count = 0
+            # Check if already logged in
+            await page.goto("https://web.whatsapp.com")
+            try:
+                await page.wait_for_selector(
+                    'div[data-testid="default-user"], div[data-testid="chat-list"]',
+                    timeout=15_000
+                )
+                logger.info("Session active — already logged in.")
+            except Exception:
+                logger.info("Scan QR code now... waiting for login.")
+                await page.wait_for_selector(
+                    'div[data-testid="default-user"], div[data-testid="chat-list"]',
+                    timeout=120_000
+                )
+                logger.info("Logged in!")
 
-        for i, contact in enumerate(pending, 1):
-            name = contact["name"]
-            phone = contact["phone"]
-            msg = render_template(template, name)
+            for i, contact in enumerate(pending, 1):
+                name = contact["name"]
+                phone = contact["phone"]
+                msg = render_template(template, name)
 
-            logger.info(f"[{i}/{len(pending)}] Sending to {name} ({phone})...")
+                logger.info(f"[{i}/{len(pending)}] Sending to {name} ({phone})...")
 
-            success = False
-            for attempt in range(1, MAX_RETRIES + 2):
-                try:
-                    success = await send_message(page, phone, msg, IMAGE_FILE)
-                    if success:
-                        break
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt} failed for {name}: {e}")
-                    if attempt <= MAX_RETRIES:
-                        await asyncio.sleep(5)
+                success = False
+                for attempt in range(1, MAX_RETRIES + 2):
+                    try:
+                        success = await send_message(page, phone, msg, IMAGE_FILE)
+                        if success:
+                            break
+                    except Exception as e:
+                        logger.warning(f"Attempt {attempt} failed for {name}: {e}")
+                        if attempt <= MAX_RETRIES:
+                            await asyncio.sleep(5)
 
-            if success:
-                log_sent(contact)
-                sent_count += 1
-                logger.info(f"  ✓ Sent to {name}")
-            else:
-                log_failed(contact, "send failed")
-                failed_count += 1
-                logger.error(f"  ✗ Failed to send to {name}")
+                if success:
+                    log_sent(contact)
+                    sent_count += 1
+                    logger.info(f"  ✓ Sent to {name}")
+                else:
+                    log_failed(contact, "send failed")
+                    failed_count += 1
+                    logger.error(f"  ✗ Failed to send to {name}")
 
-            # Random delay between messages
-            if i < len(pending):
-                delay = random.uniform(min_delay, max_delay)
-                logger.info(f"  Waiting {delay:.1f}s...")
-                await asyncio.sleep(delay)
+                # Random delay between messages
+                if i < len(pending):
+                    delay = random.uniform(min_delay, max_delay)
+                    logger.info(f"  Waiting {delay:.1f}s...")
+                    await asyncio.sleep(delay)
 
-        logger.info(f"=== Complete: {sent_count} sent, {failed_count} failed ===")
+            logger.info(f"=== Complete: {sent_count} sent, {failed_count} failed ===")
 
-        await browser.close()
+    except KeyboardInterrupt:
+        logger.info("\nInterrupted by user. Closing browser...")
+        logger.info(f"Progress so far: {sent_count} sent, {failed_count} failed")
+    finally:
+        if browser:
+            await browser.close()
+
 
 @click.command()
 @click.option("--dry-run", is_flag=True, help="Preview messages without sending")
