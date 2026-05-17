@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """WhatsApp Bulk Messenger — Playwright automation for wedding invitations."""
 
-import asyncio
-import csv
-import logging
-import os
-import random
-import re
-import sys
+from playwright.async_api import (
+    async_playwright,
+    Page,
+    TimeoutError as PwTimeoutError,
+    expect,
+    FileChooser
+)
 from datetime import datetime
 from itertools import count
 from pathlib import Path
-
+import asyncio
+import logging
+import random
 import click
-from playwright.async_api import async_playwright
-from playwright.async_api import TimeoutError as PwTimeoutError
+import sys
+import csv
+import re
+
 
 # --- Config ---
 SESSION_DIR = Path("./whatsapp_session")
@@ -46,8 +50,9 @@ logger = logging.getLogger(__name__)
 def clean_phone(raw: str, default_code: str = DEFAULT_COUNTRY_CODE) -> str:
     """Strip non-digits, add country code if missing, return WhatsApp-safe number."""
     digits = re.sub(r"[^\d+]", "", raw.strip())
-    # Collapse multiple + to one
-    digits = "+" + digits.replace("+", "")
+    # Collapse multiple + to one, remove spaces and dashes
+    digits = re.sub(r"[- ]+", "", digits)
+    digits = re.sub(r"\++", "+", digits)
     if digits.startswith("00"):
         digits = "+" + digits[2:]
     if digits.startswith("0"):
@@ -148,7 +153,7 @@ async def click_send_btn(page, send_btn_xpath: str):
 
 
 # --- WhatsApp Web automation ---
-async def send_message(page, phone: str, message: str, image_path: Path | None = None) -> bool:
+async def send_message(page: Page, phone: str, message: str, image_path: Path | None = None) -> bool:
     """Search contact, open chat, send message + optional image, return to list."""
     SEARCH_BAR = '*[aria-label="Search or start a new chat"]'
     CLEAR_SEARCH_BUTTON = '*[aria-label="End icon button"]'
@@ -156,6 +161,10 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
     SEND_BUTTON = 'span[data-testid="wds-ic-send-filled"]'
     IMG_MESSAGE_INPUT = '[aria-label*="Type a message"]'
     MESSAGE_INPUT = '[aria-label*="Type a message"]'
+    MSG_NOT_SENT = '//span[@data-testid="msg-time"]'
+    # MSG_ONE_TICK = 'span[@data-testid="msg-check"]'
+    # MSG_TWO_TICK = 'span[@data-testid="msg-dblcheck"]'
+    
 
     # Click search bar or clear button, type phone
     selector = await page.wait_for_selector(SEARCH_BAR + ", " + CLEAR_SEARCH_BUTTON, timeout=15_000)
@@ -185,7 +194,7 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
         async with page.expect_file_chooser() as fc_info:
             photo_option = await page.wait_for_selector("text=Photos & videos", timeout=10_000)
             await photo_option.click()
-        file_chooser = await fc_info.value
+        file_chooser: FileChooser = await fc_info.value
         await file_chooser.set_files(str(image_path))
 
         # Wait for image preview + caption area to appear
@@ -206,9 +215,14 @@ async def send_message(page, phone: str, message: str, image_path: Path | None =
 
     await click_send_btn(page, SEND_BUTTON)
 
-    await asyncio.sleep(1)
+    await asyncio.sleep(2)
 
-    return True
+    # Wait for message to be sent
+    try:
+        await expect(page.locator(MSG_NOT_SENT).last).not_to_be_visible(timeout=30_000)
+        return True
+    except AssertionError:
+        return False
 
 
 async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, country_code: str):
@@ -346,6 +360,8 @@ async def run(dry_run: bool, limit: int | None, min_delay: int, max_delay: int, 
                     delay = random.uniform(min_delay, max_delay)
                     logger.info(f"  Waiting {delay:.1f}s...")
                     await asyncio.sleep(delay)
+            
+            await asyncio.sleep(10)
 
             logger.info(f"=== Complete: {sent_count} sent, {failed_count} failed ===")
 
