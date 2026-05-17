@@ -2,6 +2,10 @@
 
 Playwright automation for sending bulk WhatsApp messages with personalized text and image attachments.
 
+## Backstory
+
+A friend getting married needed a simple way to send bulk invitations to their contacts. This tool was built to automate that process reliably.
+
 ## Requirements
 
 - Python 3.10+
